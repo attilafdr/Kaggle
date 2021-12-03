@@ -6,30 +6,57 @@ import numpy as np
 import pandas as pd
 
 from sklearn import svm, linear_model, ensemble, tree
-from sklearn.impute import SimpleImputer
 from sklearn.model_selection import KFold
-from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
+from sklearn.model_selection import GridSearchCV
 
-def data_preprocess(df):
-    # Transform the categorical sex value to one-hot representation, so it can be processed independently
-    df_sex = pd.get_dummies(data=df['Sex'], columns=['Sex'], drop_first=False)
-    df_embarked = pd.get_dummies(data=df['Embarked'], columns=['Embarked'], drop_first=False)
+class DataPreprocessor(object):
+    """Some preprocessing parameters are learned from the data"""
+    def __init__(self, data, cols):
+        self.surv_lookups = {}
+        self.avg_surv_rate = 0
 
-    # Pclass, Age, Fare,
+        self.generate_replace_lookups(data, cols)
 
-    np_data = np.array(pd.concat([df['Age'], df['Pclass'], df['Fare'], df_embarked, df_sex], axis=1))
-    np_ids = np.array(df['PassengerId'])
+    def generate_replace_lookups(self, data, cols):
+        """Learn preprocessing parameters"""
+        # Calculate the average survival rate of all passengers
+        self.avg_surv_rate = data['Survived'].mean()
+        # Calculate the probability of survivors for each group
+        for col in cols:
+            # Save the probabilities for later use
+            self.surv_lookups[col] = data[['Survived', col]].groupby([col]).mean()
 
-    # Fill missing values
-    data_imputer = SimpleImputer(missing_values=np.nan, strategy='median')
-    np_data = data_imputer.fit_transform(np_data)
+    def preprocess(self, data):
+        """Apply learned preprocessing"""
+        # Drop the name as it carries no information
+        data.drop(['Name'], axis=1, inplace=True)
 
-    if 'Survived' in df.columns:
-        labels_arr = np.array(df['Survived'])
-    else:
-        labels_arr = None
+        # Clean Ticket strings to numbers. Dropped for now.
+        data['Ticket'] = data['Ticket'].apply(lambda s: s.split(' ')[-1])
+        data.drop(['Ticket'], axis=1, inplace=True)
 
-    return np_data, np_ids, labels_arr
+        # Get the sector value from cabin numbers
+        data['Cabin'] = data['Cabin'].apply(lambda s: str(s)[0] if s is not np.nan else None)
+
+        # Replace sex with a boolean value
+        data['Sex'].replace({'male': 0, 'female': 1}, inplace=True)
+
+        # Replace the string value with the calculated group probabilities
+        cols = ['Cabin', 'Embarked', 'SibSp', 'Parch']
+        for col in cols:
+            data[col] = data[col].apply(lambda s: self.surv_lookups[col].at[s, 'Survived']
+            if s in self.surv_lookups[col].index.values else self.avg_surv_rate)
+
+        # Convert to numpy arrays
+        np_data = np.array(data[['Pclass', 'Sex', 'Age', 'SibSp', 'Parch', 'Fare', 'Cabin', 'Embarked']])
+        np_ids = np.array(data['PassengerId'])
+
+        if 'Survived' in data.columns:
+            labels_arr = np.array(data['Survived'])
+        else:
+            labels_arr = None
+
+        return np_data, np_ids, labels_arr
 
 if __name__ == '__main__':
     # Load all available training data
@@ -42,60 +69,44 @@ if __name__ == '__main__':
     df_scores = pd.DataFrame(columns=['F1', 'Precision', 'Recall', 'Accuracy'])
     df_model_agg_scores = pd.DataFrame(columns=['Model', 'Avg score', 'Min score', 'Max score'])
 
-    # Models to be trained and compared
-    models = [linear_model.RidgeClassifier(alpha=.5),
-              tree.DecisionTreeClassifier(),
-              linear_model.LogisticRegression(solver='liblinear', random_state=42),
-              ensemble.GradientBoostingClassifier(),
-              ensemble.RandomForestClassifier(),
-              linear_model.SGDClassifier(loss="log"),
-              svm.SVC()]
+    # Hyperparameter optimisation
+    model_prototypes = [{'model': ensemble.HistGradientBoostingClassifier(),
+                         'params': {'learning_rate': [0.1],
+                                    'max_leaf_nodes': [15],
+                                    'min_samples_leaf': [32],
+                                    'l2_regularization': [.7],
+                                    'max_bins': [30]}}]
+
+    # Initialise data preprocessor and learn parameters
+    preprocessor = DataPreprocessor(data=df_all_train, cols=['Cabin', 'Embarked', 'SibSp', 'Parch'])
 
     # Run an experiment for each split and log the scores
-    for model in models:
-        for k, kf_split in enumerate(kf_splits.split(df_all_train)):
-            df_train = df_all_train.iloc[kf_split[0]]
-            df_test = df_all_train.iloc[kf_split[1]]
+    for m, model_prototype in enumerate(model_prototypes):
+        model = GridSearchCV(estimator=model_prototype['model'], param_grid=model_prototype['params'],
+                              cv=kf_splits, scoring='f1', refit=True, n_jobs=8)
 
-            train_arr, _, train_labels_arr = data_preprocess(df_train)
+        train_arr, _, train_labels_arr = preprocessor.preprocess(df_all_train)
 
-            model.fit(train_arr, train_labels_arr)
+        model.fit(train_arr, train_labels_arr)
 
-            test_arr, test_ids_arr, test_labels_arr = data_preprocess(df_test)
-            pred_arr = model.predict(test_arr)
+        model_prototypes[m]['best_score'] = model.best_score_
+        model_prototypes[m]['model'] = model
 
-            scores = {'F1': f1_score(test_labels_arr, pred_arr),
-                      'Precision': precision_score(test_labels_arr, pred_arr),
-                      'Recall': recall_score(test_labels_arr, pred_arr),
-                      'Accuracy': accuracy_score(test_labels_arr, pred_arr)}
-
-            df_scores = df_scores.append(scores, ignore_index=True)
-
-        # Aggregare and log results
-        df_mean = df_scores.aggregate(['mean', 'min', 'max'], axis=0)
-        df_model_agg_scores = df_model_agg_scores.append({'Model': str(model.__class__).split('.')[-1][:-2],
-                                                          'Avg score': df_mean.iloc[0]['F1'],
-                                                          'Min score': df_mean.iloc[1]['F1'],
-                                                          'Max score': df_mean.iloc[2]['F1']},
-                                                         ignore_index=True)
-
-    print(df_model_agg_scores)
+        print(model.best_score_)
+        print(model.best_params_)
 
     # Find best model
-    model = models[df_model_agg_scores['Avg score'].idxmax()]
-
-    # Fit final model with all data
-    train_arr, _, train_labels_arr = data_preprocess(df_all_train)
-    model.fit(train_arr, train_labels_arr)
+    model = sorted(model_prototypes, key=lambda s: s['best_score'])[-1]
+    print(model['best_score'])
 
     # Load and prepare test data
     df_test = pd.read_csv('./titanic/data/test.csv')
-    test_arr, test_ids_arr, _ = data_preprocess(df_test)
+    test_arr, test_ids_arr, _ = preprocessor.preprocess(df_test)
 
     # Make predictions
-    pred_arr = model.predict(test_arr)
+    pred_arr = model['model'].predict(test_arr)
 
     # Construct output data format
     out = np.stack([test_ids_arr, pred_arr]).transpose()
-    np.savetxt("output.csv", out, delimiter=",", fmt='%d', header='PassengerId,Survived')
+    np.savetxt("output.csv", out, comments='', delimiter=",", fmt='%d', header='PassengerId,Survived')
 
