@@ -1,11 +1,11 @@
 """
-Generates a submission file for the Kaggle Titanic challenge
+Selects the best model and generates a submission file for the Kaggle Titanic challenge
 """
 
 import numpy as np
 import pandas as pd
 
-from sklearn import svm, linear_model, ensemble, tree
+from sklearn import ensemble
 from sklearn.model_selection import KFold
 from sklearn.model_selection import GridSearchCV
 
